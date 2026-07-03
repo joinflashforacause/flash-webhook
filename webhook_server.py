@@ -22,7 +22,7 @@ Environment variables needed on Render:
   INBOX_PASSWORD  = password for this page
 """
 
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, send_from_directory
 import csv
 import io
 import os
@@ -34,6 +34,19 @@ from datetime import datetime
 from functools import wraps
 
 app = Flask(__name__)
+
+# =========================================================
+# STATIC MEDIA (for template headers needing a public URL —
+# e.g. the donation QR code, or the Smaranotsavam video)
+# =========================================================
+# Put files in a "media" folder next to this script, then push to GitHub.
+# They'll be reachable at: https://flash-webhook.onrender.com/media/<filename>
+MEDIA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "media")
+
+
+@app.route("/media/<path:filename>")
+def serve_media(filename):
+    return send_from_directory(MEDIA_DIR, filename)
 
 # =========================================================
 # CONFIGURATION
