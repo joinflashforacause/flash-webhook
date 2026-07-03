@@ -152,3 +152,22 @@ def record_sent(name, phone, amount, date):
     conn.commit()
     cur.close()
     conn.close()
+
+
+def get_incoming_texts():
+    """All incoming (direction='in') messages, oldest first, for RSVP tallying."""
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT contact_number AS number,
+               COALESCE(NULLIF(contact_name, ''), contact_number) AS name,
+               message_text AS text,
+               ts
+        FROM messages
+        WHERE direction = 'in'
+        ORDER BY ts ASC
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
