@@ -1,0 +1,154 @@
+"""
+Persistent storage layer using Postgres (survives Render redeploys).
+
+Render's free "Web Service" filesystem is wiped on every redeploy. A
+Postgres database is a separate, persistent service, so storing messages
+there means your inbox history survives redeploys forever.
+
+Connects using the DATABASE_URL environment variable, which Render sets
+automatically once you link a Postgres database to this web service.
+"""
+
+import os
+import psycopg2
+import psycopg2.extras
+from datetime import datetime
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+
+def get_conn():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not set - link a Postgres database in Render first.")
+    # Render's internal Postgres URLs sometimes start with postgres:// ; psycopg2 wants postgresql://
+    url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    return psycopg2.connect(url)
+
+
+def init_db():
+    """Create tables if they don't exist yet. Safe to call on every startup."""
+    if not DATABASE_URL:
+        print("WARNING: DATABASE_URL not set - falling back to non-persistent storage.")
+        return
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id SERIAL PRIMARY KEY,
+            ts TIMESTAMP NOT NULL DEFAULT NOW(),
+            direction TEXT NOT NULL,
+            contact_number TEXT NOT NULL,
+            contact_name TEXT,
+            message_type TEXT,
+            message_text TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS statuses (
+            id SERIAL PRIMARY KEY,
+            ts TIMESTAMP NOT NULL DEFAULT NOW(),
+            recipient_number TEXT NOT NULL,
+            status TEXT,
+            error TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS bulk_sent_log (
+            id SERIAL PRIMARY KEY,
+            ts TIMESTAMP NOT NULL DEFAULT NOW(),
+            name TEXT,
+            phone TEXT NOT NULL,
+            amount TEXT,
+            date TEXT
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_contact ON messages(contact_number)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_bulk_sent_phone ON bulk_sent_log(phone)")
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def log_message(direction, contact_number, contact_name, message_type, message_text, ts=None):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO messages (ts, direction, contact_number, contact_name, message_type, message_text) "
+        "VALUES (%s, %s, %s, %s, %s, %s)",
+        (ts or datetime.now(), direction, contact_number, contact_name, message_type, message_text)
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def log_status(recipient_number, status, error, ts=None):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO statuses (ts, recipient_number, status, error) VALUES (%s, %s, %s, %s)",
+        (ts or datetime.now(), recipient_number, status, error)
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def get_conversations():
+    """List of contacts with their latest message, newest first."""
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT DISTINCT ON (contact_number)
+            contact_number AS number,
+            COALESCE(NULLIF(contact_name, ''), contact_number) AS name,
+            message_text AS last_message,
+            ts AS last_time
+        FROM messages
+        ORDER BY contact_number, ts DESC
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    rows = sorted(rows, key=lambda r: r["last_time"], reverse=True)
+    for r in rows:
+        r["last_time"] = r["last_time"].strftime("%Y-%m-%d %H:%M:%S")
+    return rows
+
+
+def get_messages(number):
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(
+        "SELECT ts AS timestamp, direction, contact_number, contact_name, "
+        "message_type, message_text FROM messages WHERE contact_number = %s ORDER BY ts ASC",
+        (number,)
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    for r in rows:
+        r["timestamp"] = r["timestamp"].strftime("%Y-%m-%d %H:%M:%S")
+    return rows
+
+
+def load_sent_numbers():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT phone FROM bulk_sent_log")
+    rows = {r[0] for r in cur.fetchall()}
+    cur.close()
+    conn.close()
+    return rows
+
+
+def record_sent(name, phone, amount, date):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO bulk_sent_log (name, phone, amount, date) VALUES (%s, %s, %s, %s)",
+        (name, phone, amount, date)
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
