@@ -49,10 +49,6 @@ WABA_ID = "1730916004764751"  # WhatsApp Business Account ID (for listing templa
 TEXT_TEMPLATE_NAME = "donor_thank_you_meeting_update_te"
 TEMPLATE_LANGUAGE = "te"
 
-MESSAGES_CSV = "messages.csv"
-STATUSES_CSV = "statuses.csv"
-SENT_LOG_CSV = "bulk_sent_log.csv"
-
 MSG_FIELDS = ["timestamp", "direction", "contact_number", "contact_name", "message_type", "message_text"]
 
 GRAPH = "https://graph.facebook.com/v20.0"
@@ -75,27 +71,10 @@ def requires_auth(f):
 # =========================================================
 # STORAGE HELPERS
 # =========================================================
-def append_csv(filepath, fieldnames, row):
-    file_exists = os.path.exists(filepath)
-    with open(filepath, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(row)
-
-
-def read_all_messages():
-    if not os.path.exists(MESSAGES_CSV):
-        return []
-    with open(MESSAGES_CSV, newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
-
+import db as storage
 
 def load_sent_numbers():
-    if not os.path.exists(SENT_LOG_CSV):
-        return set()
-    with open(SENT_LOG_CSV, newline="", encoding="utf-8") as f:
-        return {row["phone"] for row in csv.DictReader(f)}
+    return storage.load_sent_numbers()
 
 
 def clean_phone(phone):
@@ -106,14 +85,7 @@ def clean_phone(phone):
 
 
 def log_outgoing(number, name, mtype, text):
-    append_csv(MESSAGES_CSV, MSG_FIELDS, {
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "direction": "out",
-        "contact_number": number,
-        "contact_name": name,
-        "message_type": mtype,
-        "message_text": text,
-    })
+    storage.log_message("out", number, name, mtype, text)
 
 
 # =========================================================
@@ -123,9 +95,9 @@ def meta_headers():
     return {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
 
 
-def send_template(to, name, amount, date, template_name=None, media_type=None, media_url=None, language=None):
-    """Send a template. If media_type+media_url given, the template must have
-    an image/video header. Otherwise uses a text header with the name."""
+def send_template(to, name, amount, date, template_name=None, media_type=None, media_url=None, language=None, body_vars=3):
+    """Send a template. body_vars controls how many {{n}} body parameters the
+    template expects (0 = plain template like hello_world; 3 = name/amount/date)."""
     tname = template_name or TEXT_TEMPLATE_NAME
     lang = language or TEMPLATE_LANGUAGE
     components = []
@@ -135,27 +107,31 @@ def send_template(to, name, amount, date, template_name=None, media_type=None, m
             "type": "header",
             "parameters": [{"type": media_type, media_type: {"link": media_url}}]
         })
-    else:
+    elif body_vars >= 1:
         components.append({
             "type": "header",
             "parameters": [{"type": "text", "text": name}]
         })
 
-    components.append({
-        "type": "body",
-        "parameters": [
-            {"type": "text", "text": name},
-            {"type": "text", "text": amount},
-            {"type": "text", "text": date}
-        ]
-    })
+    if body_vars >= 3:
+        components.append({
+            "type": "body",
+            "parameters": [
+                {"type": "text", "text": name},
+                {"type": "text", "text": amount},
+                {"type": "text", "text": date}
+            ]
+        })
+
+    payload_template = {"name": tname, "language": {"code": lang}}
+    if components:
+        payload_template["components"] = components
 
     return http_requests.post(
         f"{GRAPH}/{PHONE_NUMBER_ID}/messages",
         headers={**meta_headers(), "Content-Type": "application/json"},
         json={"messaging_product": "whatsapp", "to": to, "type": "template",
-              "template": {"name": tname, "language": {"code": lang},
-                           "components": components}},
+              "template": payload_template},
         timeout=30
     )
 
@@ -199,26 +175,18 @@ def receive_webhook():
                     else:
                         text_body = f"[{msg_type} message received]"
 
-                    readable = datetime.fromtimestamp(int(timestamp)).strftime("%Y-%m-%d %H:%M:%S") if timestamp else ""
-                    append_csv(MESSAGES_CSV, MSG_FIELDS, {
-                        "timestamp": readable, "direction": "in",
-                        "contact_number": from_number, "contact_name": contact_name,
-                        "message_type": msg_type, "message_text": text_body,
-                    })
+                    ts_dt = datetime.fromtimestamp(int(timestamp)) if timestamp else datetime.now()
+                    storage.log_message("in", from_number, contact_name, msg_type, text_body, ts=ts_dt)
 
                 for status in value.get("statuses", []):
                     ts = status.get("timestamp", "")
-                    readable = datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M:%S") if ts else ""
+                    ts_dt = datetime.fromtimestamp(int(ts)) if ts else datetime.now()
                     error_msg = ""
                     if status.get("status") == "failed":
                         errs = status.get("errors", [])
                         if errs:
                             error_msg = errs[0].get("title", "")
-                    append_csv(STATUSES_CSV,
-                               ["updated_at", "recipient_number", "status", "error"],
-                               {"updated_at": readable,
-                                "recipient_number": status.get("recipient_id", ""),
-                                "status": status.get("status", ""), "error": error_msg})
+                    storage.log_status(status.get("recipient_id", ""), status.get("status", ""), error_msg, ts=ts_dt)
     except Exception as ex:
         print(f"Webhook error: {ex}")
     return jsonify({"status": "received"}), 200
@@ -230,24 +198,13 @@ def receive_webhook():
 @app.route("/api/conversations")
 @requires_auth
 def api_conversations():
-    msgs = read_all_messages()
-    convos = {}
-    for m in msgs:
-        num = m["contact_number"]
-        if num not in convos:
-            convos[num] = {"number": num, "name": m["contact_name"] or num,
-                           "last_message": "", "last_time": ""}
-        if m["contact_name"]:
-            convos[num]["name"] = m["contact_name"]
-        convos[num]["last_message"] = m["message_text"]
-        convos[num]["last_time"] = m["timestamp"]
-    return jsonify(sorted(convos.values(), key=lambda c: c["last_time"], reverse=True))
+    return jsonify(storage.get_conversations())
 
 
 @app.route("/api/messages/<number>")
 @requires_auth
 def api_messages(number):
-    return jsonify([m for m in read_all_messages() if m["contact_number"] == number])
+    return jsonify(storage.get_messages(number))
 
 
 @app.route("/api/send", methods=["POST"])
@@ -327,18 +284,23 @@ def api_send_template():
     template_lang = b.get("template_lang", "").strip()
     media_type = b.get("media_type", "").strip()
     media_url = b.get("media_url", "").strip()
-    if not all([to, name, amount, date]):
-        return jsonify({"error": "Missing to/name/amount/date"}), 400
+    body_vars = int(b.get("body_vars", 3))
+    if not to:
+        return jsonify({"error": "Missing phone number"}), 400
+    if body_vars >= 3 and not all([name, amount, date]):
+        return jsonify({"error": "Missing name/amount/date"}), 400
     if media_type and not media_url:
         return jsonify({"error": "This template has a media header - a media URL is required"}), 400
     resp = send_template(to, name, amount, date,
                          template_name=template_name or None,
                          media_type=media_type or None,
                          media_url=media_url or None,
-                         language=template_lang or None)
+                         language=template_lang or None,
+                         body_vars=body_vars)
     if resp.status_code == 200:
         shown = template_name or TEXT_TEMPLATE_NAME
-        log_outgoing(to, name, "template", f"[Template {shown}] {name} — ₹{amount} — {date}")
+        detail = f"{name} — ₹{amount} — {date}" if body_vars >= 3 else "(no variables)"
+        log_outgoing(to, name, "template", f"[Template {shown}] {detail}")
         return jsonify({"status": "sent", "to": to})
     return jsonify({"error": f"Meta API {resp.status_code}", "detail": resp.text[:400]}), 502
 
@@ -381,9 +343,7 @@ def bulk_worker(rows, cap, delay, template_name, media_type, media_url, template
                 if resp.status_code == 200:
                     bulk_state["success"] += 1
                     bulk_state["log"].append(f"OK: {name} ({phone})")
-                    append_csv(SENT_LOG_CSV, ["name", "phone", "amount", "date", "sent_at"],
-                               {"name": name, "phone": phone, "amount": amount,
-                                "date": date, "sent_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+                    storage.record_sent(name, phone, amount, date)
                     log_outgoing(phone, name, "template", f"[Bulk template] {name} — ₹{amount} — {date}")
                 else:
                     bulk_state["failed"] += 1
@@ -633,12 +593,14 @@ PAGE_HTML = """
     </div>
     <label>Phone number (10 digits or with 91)</label>
     <input id="nc_phone" placeholder="9848119567">
-    <label>Contributor name</label>
-    <input id="nc_name" placeholder="సిరిగినీడి నాగేశ్వరరావు">
-    <label>Contribution amount (without ₹)</label>
-    <input id="nc_amount" placeholder="1,116">
-    <label>Contribution date</label>
-    <input id="nc_date" placeholder="03 జూలై 2026">
+    <div id="nc_varsWrap">
+      <label>Contributor name</label>
+      <input id="nc_name" placeholder="సిరిగినీడి నాగేశ్వరరావు">
+      <label>Contribution amount (without ₹)</label>
+      <input id="nc_amount" placeholder="1,116">
+      <label>Contribution date</label>
+      <input id="nc_date" placeholder="03 జూలై 2026">
+    </div>
     <div class="actions">
       <button class="cancel" onclick="closeNewChat()">Cancel</button>
       <button class="send" id="nc_sendBtn" onclick="sendNewChat()">Send Template</button>
@@ -734,14 +696,18 @@ function ncTemplateChanged() {
   const t = templates[parseInt(document.getElementById('nc_template').value)];
   const needsMedia = t && (t.header_type === 'image' || t.header_type === 'video');
   document.getElementById('nc_mediaWrap').style.display = needsMedia ? 'block' : 'none';
+  const hasVars = t && t.body_vars >= 3;
+  document.getElementById('nc_varsWrap').style.display = hasVars ? 'block' : 'none';
 }
 
 async function sendNewChat() {
   const g = id => document.getElementById(id).value.trim();
-  const phone=g('nc_phone'), name=g('nc_name'), amount=g('nc_amount'), date=g('nc_date');
   const t = templates[parseInt(g('nc_template'))];
-  if (!phone||!name||!amount||!date) { alert('Fill in all fields.'); return; }
   if (!t) { alert('Select a template.'); return; }
+  const hasVars = t.body_vars >= 3;
+  const phone=g('nc_phone'), name=hasVars?g('nc_name'):'-', amount=hasVars?g('nc_amount'):'-', date=hasVars?g('nc_date'):'-';
+  if (!phone) { alert('Enter a phone number.'); return; }
+  if (hasVars && (!g('nc_name')||!g('nc_amount')||!g('nc_date'))) { alert('Fill in name, amount and date.'); return; }
   const needsMedia = (t.header_type === 'image' || t.header_type === 'video');
   const mediaUrl = needsMedia ? g('nc_mediaUrl') : '';
   if (needsMedia && !mediaUrl) { alert('This template needs a media URL.'); return; }
@@ -750,7 +716,7 @@ async function sendNewChat() {
   btn.disabled=true; btn.textContent='Sending…';
   const res = await fetch('/api/send_template', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({to:phone, name, amount, date,
-      template_name: t.name, template_lang: t.language,
+      template_name: t.name, template_lang: t.language, body_vars: t.body_vars,
       media_type: needsMedia ? t.header_type : '', media_url: mediaUrl})});
   btn.disabled=false; btn.textContent='Send Template';
   if (res.ok) { const d = await res.json(); closeNewChat();
@@ -838,5 +804,10 @@ def inbox():
 
 
 if __name__ == "__main__":
+    storage.init_db()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+else:
+    # When run via gunicorn (Render), __main__ block doesn't execute -
+    # initialize the database here instead.
+    storage.init_db()
