@@ -26,6 +26,7 @@ from flask import Flask, request, jsonify, Response
 import csv
 import io
 import os
+import re
 import time
 import threading
 import requests as http_requests
@@ -86,6 +87,40 @@ def clean_phone(phone):
 
 def log_outgoing(number, name, mtype, text):
     storage.log_message("out", number, name, mtype, text)
+
+
+# =========================================================
+# RSVP KEYWORD DETECTION (best-effort, not exact)
+# =========================================================
+# Looks at each contact's most recent incoming reply and guesses whether
+# they confirmed attendance. Simple keyword match across English + Telugu
+# (script and common romanized spellings) - it will miss unusual phrasing,
+# so the "Unclear" bucket is worth a manual glance rather than trusted blindly.
+RSVP_YES_KEYWORDS = [
+    "yes", "yeah", "yep", "sure", "will come", "coming", "attend", "attending",
+    "definitely", "count me in", "will attend", "surely", "ok will come",
+    "వస్తాను", "వస్తా", "తప్పకుండా", "వచ్చేస్తాను", "వస్తున్నాను", "వస్తున్నాము", "వస్తాము",
+    "vastanu", "vasthanu", "vastam", "tappakunda", "vastunnanu", "vastunnamu",
+]
+RSVP_NO_KEYWORDS = [
+    "no", "not able", "can't come", "cant come", "cannot attend", "unable to attend",
+    "sorry can't", "sorry cant", "won't be able", "will not come", "not coming",
+    "రాలేను", "రాను", "రాలేకపోతున్నాను", "రాలేకపోతున్నాము",
+    "raanu", "raalenu", "raalekapotunnanu",
+]
+
+
+def classify_rsvp(text):
+    t = (text or "").strip().lower()
+    if not t:
+        return "unclear"
+    for kw in RSVP_NO_KEYWORDS:
+        if re.search(r"\b" + re.escape(kw.lower()) + r"\b", t):
+            return "no"
+    for kw in RSVP_YES_KEYWORDS:
+        if re.search(r"\b" + re.escape(kw.lower()) + r"\b", t):
+            return "yes"
+    return "unclear"
 
 
 # =========================================================
@@ -205,6 +240,26 @@ def api_conversations():
 @requires_auth
 def api_messages(number):
     return jsonify(storage.get_messages(number))
+
+
+@app.route("/api/rsvp_tally")
+@requires_auth
+def api_rsvp_tally():
+    """Best-effort RSVP count based on each contact's most recent reply."""
+    msgs = storage.get_incoming_texts()
+    latest = {}
+    for m in msgs:
+        latest[m["number"]] = m  # ascending order -> last write is most recent reply
+    yes, no, unclear = [], [], []
+    for number, m in latest.items():
+        cat = classify_rsvp(m["text"])
+        entry = {"number": number, "name": m["name"], "text": m["text"]}
+        (yes if cat == "yes" else no if cat == "no" else unclear).append(entry)
+    return jsonify({
+        "total_replied": len(latest),
+        "yes_count": len(yes), "no_count": len(no), "unclear_count": len(unclear),
+        "yes": yes, "no": no, "unclear": unclear,
+    })
 
 
 @app.route("/api/send", methods=["POST"])
@@ -514,6 +569,7 @@ PAGE_HTML = """
   <div class="tabs">
     <button class="tab active" id="tabInbox" onclick="showTab('inbox')">Inbox</button>
     <button class="tab" id="tabBulk" onclick="showTab('bulk')">Bulk Send</button>
+    <button class="tab" id="tabRsvp" onclick="showTab('rsvp')">RSVP</button>
   </div>
 </header>
 
@@ -579,6 +635,18 @@ PAGE_HTML = """
   </div>
 </div>
 
+<!-- ============ RSVP PAGE ============ -->
+<div class="page" id="pageRsvp">
+  <div class="bulk" style="max-width:900px">
+    <h2>RSVP Tally</h2>
+    <p class="sub">Auto-detected from each contact's latest reply (English + Telugu keywords). This is a best-effort guess, not exact — please spot-check the "Unclear" list, since people phrase things differently. Click anyone's name to open their chat.</p>
+    <div id="rsvpSummary" style="display:flex;gap:16px;margin:20px 0;flex-wrap:wrap">
+      <div class="empty">Loading…</div>
+    </div>
+    <div id="rsvpLists"></div>
+  </div>
+</div>
+
 <!-- ============ NEW CHAT MODAL ============ -->
 <div class="modal-bg" id="newChatModal">
   <div class="modal">
@@ -616,8 +684,47 @@ let currentNumber = null;
 function showTab(which) {
   document.getElementById('pageInbox').classList.toggle('active', which==='inbox');
   document.getElementById('pageBulk').classList.toggle('active', which==='bulk');
+  document.getElementById('pageRsvp').classList.toggle('active', which==='rsvp');
   document.getElementById('tabInbox').classList.toggle('active', which==='inbox');
   document.getElementById('tabBulk').classList.toggle('active', which==='bulk');
+  document.getElementById('tabRsvp').classList.toggle('active', which==='rsvp');
+  if (which === 'rsvp') loadRsvpTally();
+}
+
+/* ---------- rsvp ---------- */
+async function loadRsvpTally() {
+  const summaryEl = document.getElementById('rsvpSummary');
+  const listsEl = document.getElementById('rsvpLists');
+  const res = await fetch('/api/rsvp_tally');
+  if (!res.ok) { summaryEl.innerHTML = '<div class="empty">Could not load RSVP data</div>'; return; }
+  const d = await res.json();
+  summaryEl.innerHTML = `
+    <div style="background:#e8f5e9;border-radius:10px;padding:16px 20px;min-width:140px">
+      <div style="font-size:28px;font-weight:700;color:#075E54">${d.yes_count}</div>
+      <div style="font-size:13px;color:#444">Likely coming</div>
+    </div>
+    <div style="background:#fdecea;border-radius:10px;padding:16px 20px;min-width:140px">
+      <div style="font-size:28px;font-weight:700;color:#c0392b">${d.no_count}</div>
+      <div style="font-size:13px;color:#444">Not coming</div>
+    </div>
+    <div style="background:#f5f5f5;border-radius:10px;padding:16px 20px;min-width:140px">
+      <div style="font-size:28px;font-weight:700;color:#666">${d.unclear_count}</div>
+      <div style="font-size:13px;color:#444">Unclear reply</div>
+    </div>
+    <div style="background:#eef7ff;border-radius:10px;padding:16px 20px;min-width:140px">
+      <div style="font-size:28px;font-weight:700;color:#2980b9">${d.total_replied}</div>
+      <div style="font-size:13px;color:#444">Total replied (of 1,459)</div>
+    </div>`;
+  const section = (title, arr) => `
+    <details style="margin-top:16px">
+      <summary style="cursor:pointer;font-weight:600;padding:8px 0">${title} (${arr.length})</summary>
+      ${arr.length ? arr.map(m => `
+        <div style="padding:8px 12px;border-bottom:1px solid #eee;cursor:pointer" onclick="showTab('inbox');openChat('${m.number}','${(m.name||'').replace(/'/g,"\\\\'")}')">
+          <div style="font-weight:600;font-size:14px">${m.name} <span style="font-weight:400;color:#999;font-size:12px">(${m.number})</span></div>
+          <div style="font-size:13px;color:#555">${(m.text||'').replace(/</g,'&lt;')}</div>
+        </div>`).join('') : '<div style="color:#999;padding:8px 0">None yet</div>'}
+    </details>`;
+  listsEl.innerHTML = section('✅ Likely coming', d.yes) + section('❌ Not coming', d.no) + section('❓ Unclear — worth a manual look', d.unclear);
 }
 
 /* ---------- inbox ---------- */
@@ -791,7 +898,10 @@ async function pollBulk() {
 /* ---------- refresh loop ---------- */
 loadConversations();
 loadTemplates();
-setInterval(() => { loadConversations(); loadMessages(); }, 5000);
+setInterval(() => {
+  loadConversations(); loadMessages();
+  if (document.getElementById('pageRsvp').classList.contains('active')) loadRsvpTally();
+}, 5000);
 </script>
 </body>
 </html>
