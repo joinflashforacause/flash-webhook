@@ -87,8 +87,8 @@ def requires_auth(f):
 # =========================================================
 import db as storage
 
-def load_sent_numbers():
-    return storage.load_sent_numbers()
+def load_sent_numbers(template_name=None):
+    return storage.load_sent_numbers(template_name)
 
 
 def clean_phone(phone):
@@ -151,9 +151,12 @@ def send_template(to, name, amount, date, template_name=None, media_type=None, m
     components = []
 
     if media_type and media_url:
+        media_param = {"type": media_type, media_type: {"link": media_url}}
+        if media_type == "document":
+            media_param["document"]["filename"] = media_url.rsplit("/", 1)[-1]
         components.append({
             "type": "header",
-            "parameters": [{"type": media_type, media_type: {"link": media_url}}]
+            "parameters": [media_param]
         })
     elif body_vars >= 1:
         components.append({
@@ -382,7 +385,7 @@ bulk_state = {"running": False, "total": 0, "done": 0, "success": 0,
 
 def bulk_worker(rows, cap, delay, template_name, media_type, media_url, template_lang):
     global bulk_state
-    already = load_sent_numbers()
+    already = load_sent_numbers(template_name)  # per-template, not global
     pending = []
     for r in rows:
         p = clean_phone(r.get("phone", ""))
@@ -411,7 +414,7 @@ def bulk_worker(rows, cap, delay, template_name, media_type, media_url, template
                 if resp.status_code == 200:
                     bulk_state["success"] += 1
                     bulk_state["log"].append(f"OK: {name} ({phone})")
-                    storage.record_sent(name, phone, amount, date)
+                    storage.record_sent(name, phone, amount, date, template_name)
                     log_outgoing(phone, name, "template", f"[Bulk template] {name} — ₹{amount} — {date}")
                 else:
                     bulk_state["failed"] += 1
