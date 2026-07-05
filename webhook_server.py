@@ -673,7 +673,7 @@ PAGE_HTML = """
     </select>
     <div id="nc_mediaWrap" style="display:none">
       <label>Public media URL (image/video for this template's header)</label>
-      <input id="nc_mediaUrl" placeholder="https://.../poster.jpg">
+      <input id="nc_mediaUrl" placeholder="https://.../poster.jpg or .../brochure.pdf">
     </div>
     <label>Phone number (10 digits or with 91)</label>
     <input id="nc_phone" placeholder="9848119567">
@@ -817,7 +817,7 @@ function populateNcTemplates() {
 
 function ncTemplateChanged() {
   const t = templates[parseInt(document.getElementById('nc_template').value)];
-  const needsMedia = t && (t.header_type === 'image' || t.header_type === 'video');
+  const needsMedia = t && (t.header_type === 'image' || t.header_type === 'video' || t.header_type === 'document');
   document.getElementById('nc_mediaWrap').style.display = needsMedia ? 'block' : 'none';
   const hasVars = t && t.body_vars >= 3;
   document.getElementById('nc_varsWrap').style.display = hasVars ? 'block' : 'none';
@@ -831,7 +831,7 @@ async function sendNewChat() {
   const phone=g('nc_phone'), name=hasVars?g('nc_name'):'-', amount=hasVars?g('nc_amount'):'-', date=hasVars?g('nc_date'):'-';
   if (!phone) { alert('Enter a phone number.'); return; }
   if (hasVars && (!g('nc_name')||!g('nc_amount')||!g('nc_date'))) { alert('Fill in name, amount and date.'); return; }
-  const needsMedia = (t.header_type === 'image' || t.header_type === 'video');
+  const needsMedia = (t.header_type === 'image' || t.header_type === 'video' || t.header_type === 'document');
   const mediaUrl = needsMedia ? g('nc_mediaUrl') : '';
   if (needsMedia && !mediaUrl) { alert('This template needs a media URL.'); return; }
 
@@ -868,7 +868,7 @@ async function loadTemplates() {
 function templateChanged() {
   const sel = document.getElementById('bulkTemplate');
   const t = templates[parseInt(sel.value)];
-  const needsMedia = t && (t.header_type === 'image' || t.header_type === 'video');
+  const needsMedia = t && (t.header_type === 'image' || t.header_type === 'video' || t.header_type === 'document');
   document.getElementById('mediaFields').style.display = needsMedia ? 'block' : 'none';
 }
 
@@ -879,7 +879,7 @@ async function startBulk() {
   const sel = document.getElementById('bulkTemplate');
   const t = templates[parseInt(sel.value)];
   if (!t) { alert('Select a template first.'); return; }
-  const needsMedia = (t.header_type === 'image' || t.header_type === 'video');
+  const needsMedia = (t.header_type === 'image' || t.header_type === 'video' || t.header_type === 'document');
   const mediaUrl = needsMedia ? document.getElementById('bulkMediaUrl').value.trim() : '';
   if (!csv) { alert('Paste your CSV rows first.'); return; }
   if (needsMedia && !mediaUrl) { alert('This template needs a media URL.'); return; }
