@@ -385,48 +385,53 @@ bulk_state = {"running": False, "total": 0, "done": 0, "success": 0,
 
 def bulk_worker(rows, cap, delay, template_name, media_type, media_url, template_lang):
     global bulk_state
-    already = load_sent_numbers(template_name)  # per-template, not global
-    pending = []
-    for r in rows:
-        p = clean_phone(r.get("phone", ""))
-        if p in already:
-            bulk_state["skipped"] += 1
-            continue
-        r["phone"] = p
-        pending.append(r)
+    try:
+        already = load_sent_numbers(template_name)  # per-template, not global
+        pending = []
+        for r in rows:
+            p = clean_phone(r.get("phone", ""))
+            if p in already:
+                bulk_state["skipped"] += 1
+                continue
+            r["phone"] = p
+            pending.append(r)
 
-    batch = pending[:cap]
-    bulk_state["total"] = len(batch)
+        batch = pending[:cap]
+        bulk_state["total"] = len(batch)
 
-    for r in batch:
-        name, phone = r.get("name", "").strip(), r["phone"]
-        amount, date = r.get("amount", "").strip(), r.get("date", "").strip()
-        if not all([name, phone, amount, date]):
-            bulk_state["failed"] += 1
-            bulk_state["log"].append(f"SKIP (missing data): {r}")
-        else:
-            try:
-                resp = send_template(phone, name, amount, date,
-                                     template_name=template_name or None,
-                                     media_type=media_type or None,
-                                     media_url=media_url or None,
-                                     language=template_lang or None)
-                if resp.status_code == 200:
-                    bulk_state["success"] += 1
-                    bulk_state["log"].append(f"OK: {name} ({phone})")
-                    storage.record_sent(name, phone, amount, date, template_name)
-                    log_outgoing(phone, name, "template", f"[Bulk template] {name} — ₹{amount} — {date}")
-                else:
-                    bulk_state["failed"] += 1
-                    bulk_state["log"].append(f"FAIL {resp.status_code}: {name} ({phone}) {resp.text[:150]}")
-            except Exception as ex:
+        for r in batch:
+            name, phone = r.get("name", "").strip(), r["phone"]
+            amount, date = r.get("amount", "").strip(), r.get("date", "").strip()
+            if not all([name, phone, amount, date]):
                 bulk_state["failed"] += 1
-                bulk_state["log"].append(f"ERROR: {name} ({phone}) {ex}")
-        bulk_state["done"] += 1
-        time.sleep(delay)
-
-    bulk_state["running"] = False
-    bulk_state["finished_at"] = datetime.now().strftime("%H:%M:%S")
+                bulk_state["log"].append(f"SKIP (missing data): {r}")
+            else:
+                try:
+                    resp = send_template(phone, name, amount, date,
+                                         template_name=template_name or None,
+                                         media_type=media_type or None,
+                                         media_url=media_url or None,
+                                         language=template_lang or None)
+                    if resp.status_code == 200:
+                        bulk_state["success"] += 1
+                        bulk_state["log"].append(f"OK: {name} ({phone})")
+                        storage.record_sent(name, phone, amount, date, template_name)
+                        log_outgoing(phone, name, "template", f"[Bulk template] {name} — ₹{amount} — {date}")
+                    else:
+                        bulk_state["failed"] += 1
+                        bulk_state["log"].append(f"FAIL {resp.status_code}: {name} ({phone}) {resp.text[:150]}")
+                except Exception as ex:
+                    bulk_state["failed"] += 1
+                    bulk_state["log"].append(f"ERROR: {name} ({phone}) {ex}")
+            bulk_state["done"] += 1
+            time.sleep(delay)
+    except Exception as ex:
+        # Guarantees "running" never gets stuck True even if something above
+        # (e.g. a DB hiccup in load_sent_numbers) fails unexpectedly.
+        bulk_state["log"].append(f"WORKER ERROR (stopped early): {ex}")
+    finally:
+        bulk_state["running"] = False
+        bulk_state["finished_at"] = datetime.now().strftime("%H:%M:%S")
 
 
 @app.route("/api/templates")
@@ -504,6 +509,17 @@ def api_bulk_status():
     s = dict(bulk_state)
     s["log"] = s["log"][-30:]
     return jsonify(s)
+
+
+@app.route("/api/bulk_reset", methods=["POST"])
+@requires_auth
+def api_bulk_reset():
+    """Safety valve: force-clears a stuck 'running' flag (e.g. after a hung
+    connection froze the worker thread) without needing a full server restart."""
+    global bulk_state
+    bulk_state = {"running": False, "total": 0, "done": 0, "success": 0,
+                  "failed": 0, "skipped": 0, "log": ["(manually reset)"], "finished_at": ""}
+    return jsonify({"status": "reset"})
 
 
 # =========================================================
@@ -642,6 +658,7 @@ PAGE_HTML = """
     </div>
 
     <button class="startbtn" id="bulkStart" onclick="startBulk()">Start Bulk Send</button>
+    <button type="button" onclick="resetBulk()" style="margin-left:10px;background:none;border:1px solid #ccc;border-radius:6px;padding:8px 14px;color:#888;cursor:pointer;font-size:13px">Stuck? Reset</button>
 
     <div class="progress" id="bulkProgress">
       <div class="bar"><div id="bulkBar"></div></div>
@@ -893,6 +910,16 @@ async function startBulk() {
   document.getElementById('bulkStart').disabled = true;
   document.getElementById('bulkProgress').style.display = 'block';
   bulkPolling = setInterval(pollBulk, 2000);
+}
+
+async function resetBulk() {
+  if (!confirm('Force-clear a stuck bulk send state? Only do this if it truly seems frozen.')) return;
+  await fetch('/api/bulk_reset', {method:'POST'});
+  clearInterval(bulkPolling);
+  document.getElementById('bulkStart').disabled = false;
+  document.getElementById('bulkStats').textContent = 'Reset. Ready to start again.';
+  document.getElementById('bulkBar').style.width = '0%';
+  document.getElementById('bulkLog').textContent = '';
 }
 
 async function pollBulk() {
