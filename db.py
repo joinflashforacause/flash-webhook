@@ -22,7 +22,10 @@ def get_conn():
         raise RuntimeError("DATABASE_URL is not set - link a Postgres database in Render first.")
     # Render's internal Postgres URLs sometimes start with postgres:// ; psycopg2 wants postgresql://
     url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-    return psycopg2.connect(url)
+    # connect_timeout bounds how long a hung/slow connection attempt can block a
+    # calling thread (e.g. bulk_worker) - without this, a stalled connection can
+    # freeze that thread forever, since it never reaches its own error handling.
+    return psycopg2.connect(url, connect_timeout=10)
 
 
 def init_db():
@@ -62,6 +65,11 @@ def init_db():
             date TEXT
         )
     """)
+    # Migration: track sent status per-template, not globally, so the same
+    # contact can receive multiple different broadcasts (e.g. QR image +
+    # video) without one being wrongly skipped because of the other.
+    cur.execute("ALTER TABLE bulk_sent_log ADD COLUMN IF NOT EXISTS template_name TEXT")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_bulk_sent_phone_template ON bulk_sent_log(phone, template_name)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_contact ON messages(contact_number)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_bulk_sent_phone ON bulk_sent_log(phone)")
     conn.commit()
@@ -132,22 +140,27 @@ def get_messages(number):
     return rows
 
 
-def load_sent_numbers():
+def load_sent_numbers(template_name=None):
+    """Phone numbers already sent a given template. If template_name is
+    omitted, returns numbers sent ANY template (old global behavior)."""
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT DISTINCT phone FROM bulk_sent_log")
+    if template_name:
+        cur.execute("SELECT DISTINCT phone FROM bulk_sent_log WHERE template_name = %s", (template_name,))
+    else:
+        cur.execute("SELECT DISTINCT phone FROM bulk_sent_log")
     rows = {r[0] for r in cur.fetchall()}
     cur.close()
     conn.close()
     return rows
 
 
-def record_sent(name, phone, amount, date):
+def record_sent(name, phone, amount, date, template_name=None):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO bulk_sent_log (name, phone, amount, date) VALUES (%s, %s, %s, %s)",
-        (name, phone, amount, date)
+        "INSERT INTO bulk_sent_log (name, phone, amount, date, template_name) VALUES (%s, %s, %s, %s, %s)",
+        (name, phone, amount, date, template_name)
     )
     conn.commit()
     cur.close()
