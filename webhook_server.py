@@ -164,14 +164,15 @@ def send_template(to, name, amount, date, template_name=None, media_type=None, m
             "parameters": [{"type": "text", "text": name}]
         })
 
-    if body_vars >= 3:
+    if body_vars >= 1:
+        body_params = [{"type": "text", "text": name}]
+        if body_vars >= 2:
+            body_params.append({"type": "text", "text": amount})
+        if body_vars >= 3:
+            body_params.append({"type": "text", "text": date})
         components.append({
             "type": "body",
-            "parameters": [
-                {"type": "text", "text": name},
-                {"type": "text", "text": amount},
-                {"type": "text", "text": date}
-            ]
+            "parameters": body_params
         })
 
     payload_template = {"name": tname, "language": {"code": lang}}
@@ -370,7 +371,7 @@ def api_send_template():
                          body_vars=body_vars)
     if resp.status_code == 200:
         shown = template_name or TEXT_TEMPLATE_NAME
-        detail = f"{name} — ₹{amount} — {date}" if body_vars >= 3 else "(no variables)"
+        detail = f"{name} — ₹{amount} — {date}" if body_vars >= 3 else (name if body_vars >= 1 else "(no variables)")
         log_outgoing(to, name, "template", f"[Template {shown}] {detail}")
         return jsonify({"status": "sent", "to": to})
     return jsonify({"error": f"Meta API {resp.status_code}", "detail": resp.text[:400]}), 502
@@ -383,17 +384,26 @@ bulk_state = {"running": False, "total": 0, "done": 0, "success": 0,
               "failed": 0, "skipped": 0, "log": [], "finished_at": ""}
 
 
-def bulk_worker(rows, cap, delay, template_name, media_type, media_url, template_lang):
+def bulk_worker(rows, cap, delay, template_name, media_type, media_url, template_lang, body_vars=3, template2=None):
+    """template2, if provided, is a dict {name, media_type, media_url, language, body_vars}
+    for a SECOND template sent immediately after the first, per contact - so both
+    arrive seconds apart for everyone, instead of running as two full separate passes."""
     global bulk_state
     try:
-        already = load_sent_numbers(template_name)  # per-template, not global
+        already1 = load_sent_numbers(template_name)
+        already2 = load_sent_numbers(template2["name"]) if template2 else set()
+
         pending = []
         for r in rows:
             p = clean_phone(r.get("phone", ""))
-            if p in already:
+            needs1 = p not in already1
+            needs2 = bool(template2) and p not in already2
+            if not needs1 and not needs2:
                 bulk_state["skipped"] += 1
                 continue
             r["phone"] = p
+            r["_needs1"] = needs1
+            r["_needs2"] = needs2
             pending.append(r)
 
         batch = pending[:cap]
@@ -402,27 +412,41 @@ def bulk_worker(rows, cap, delay, template_name, media_type, media_url, template
         for r in batch:
             name, phone = r.get("name", "").strip(), r["phone"]
             amount, date = r.get("amount", "").strip(), r.get("date", "").strip()
-            if not all([name, phone, amount, date]):
-                bulk_state["failed"] += 1
-                bulk_state["log"].append(f"SKIP (missing data): {r}")
-            else:
+
+            def _send_one(t_name, m_type, m_url, t_lang, b_vars, label):
+                required_ok = (name and phone) and (b_vars < 2 or amount) and (b_vars < 3 or date)
+                if not required_ok:
+                    bulk_state["failed"] += 1
+                    bulk_state["log"].append(f"SKIP (missing data) [{label}]: {r}")
+                    return
                 try:
                     resp = send_template(phone, name, amount, date,
-                                         template_name=template_name or None,
-                                         media_type=media_type or None,
-                                         media_url=media_url or None,
-                                         language=template_lang or None)
+                                         template_name=t_name or None,
+                                         media_type=m_type or None,
+                                         media_url=m_url or None,
+                                         language=t_lang or None,
+                                         body_vars=b_vars)
                     if resp.status_code == 200:
                         bulk_state["success"] += 1
-                        bulk_state["log"].append(f"OK: {name} ({phone})")
-                        storage.record_sent(name, phone, amount, date, template_name)
-                        log_outgoing(phone, name, "template", f"[Bulk template] {name} — ₹{amount} — {date}")
+                        bulk_state["log"].append(f"OK [{label}]: {name} ({phone})")
+                        storage.record_sent(name, phone, amount, date, t_name)
+                        log_outgoing(phone, name, "template", f"[Bulk {label}] {name} — ₹{amount} — {date}")
                     else:
                         bulk_state["failed"] += 1
-                        bulk_state["log"].append(f"FAIL {resp.status_code}: {name} ({phone}) {resp.text[:150]}")
+                        bulk_state["log"].append(f"FAIL {resp.status_code} [{label}]: {name} ({phone}) {resp.text[:150]}")
                 except Exception as ex:
                     bulk_state["failed"] += 1
-                    bulk_state["log"].append(f"ERROR: {name} ({phone}) {ex}")
+                    bulk_state["log"].append(f"ERROR [{label}]: {name} ({phone}) {ex}")
+
+            if r["_needs1"]:
+                _send_one(template_name, media_type, media_url, template_lang, body_vars, "1st")
+                if template2 and r["_needs2"]:
+                    time.sleep(2)  # short gap so the two land as separate-but-close messages
+            if template2 and r["_needs2"]:
+                t2 = template2
+                _send_one(t2["name"], t2.get("media_type", ""), t2.get("media_url", ""),
+                          t2.get("language", ""), t2.get("body_vars", 3), "2nd")
+
             bulk_state["done"] += 1
             time.sleep(delay)
     except Exception as ex:
@@ -480,8 +504,24 @@ def api_bulk_start():
     cap = int(b.get("cap", 250))
     template_name = b.get("template_name", "").strip()
     template_lang = b.get("template_lang", "").strip()
-    media_type = b.get("media_type", "").strip()   # "", "image", or "video"
+    media_type = b.get("media_type", "").strip()   # "", "image", "video", or "document"
     media_url = b.get("media_url", "").strip()
+    body_vars = int(b.get("body_vars", 3))
+
+    # Optional second template - sent right after the first, per contact, so
+    # both land seconds apart for everyone instead of two full separate passes.
+    template2 = None
+    template_name2 = b.get("template_name2", "").strip()
+    if template_name2:
+        template2 = {
+            "name": template_name2,
+            "media_type": b.get("media_type2", "").strip(),
+            "media_url": b.get("media_url2", "").strip(),
+            "language": b.get("template_lang2", "").strip(),
+            "body_vars": int(b.get("body_vars2", 3)),
+        }
+        if template2["media_type"] and not template2["media_url"]:
+            return jsonify({"error": "The second template has a media header - a media URL is required for it too"}), 400
 
     if media_type and not media_url:
         return jsonify({"error": "This template has a media header - a media URL is required"}), 400
@@ -512,7 +552,7 @@ def api_bulk_start():
     bulk_state = {"running": True, "total": 0, "done": 0, "success": 0,
                   "failed": 0, "skipped": 0, "log": [], "finished_at": ""}
     threading.Thread(target=bulk_worker,
-                     args=(rows, cap, 1.5, template_name, media_type, media_url, template_lang),
+                     args=(rows, cap, 1.5, template_name, media_type, media_url, template_lang, body_vars, template2),
                      daemon=True).start()
     return jsonify({"status": "started", "rows": len(rows)})
 
@@ -671,7 +711,23 @@ PAGE_HTML = """
       </div>
     </div>
 
-    <button class="startbtn" id="bulkStart" onclick="startBulk()">Start Bulk Send</button>
+    <label style="display:flex;align-items:center;gap:8px;margin-top:16px;font-weight:normal;cursor:pointer">
+      <input type="checkbox" id="pairMode" onchange="pairModeChanged()" style="width:auto">
+      Send a 2nd template right after this one, per person (so both arrive seconds apart for everyone)
+    </label>
+
+    <div id="pairFields" style="display:none;margin-top:10px;padding:14px;background:#f7f7f7;border-radius:8px">
+      <label>2nd template</label>
+      <select id="bulkTemplate2" onchange="template2Changed()">
+        <option value="">Loading templates…</option>
+      </select>
+      <div id="mediaFields2" style="display:none;margin-top:10px">
+        <label>2nd template's public media URL</label>
+        <input id="bulkMediaUrl2" placeholder="https://.../poster.jpg or video.mp4">
+      </div>
+    </div>
+
+    <button class="startbtn" id="bulkStart" onclick="startBulk()" style="margin-top:16px">Start Bulk Send</button>
     <button type="button" onclick="resetBulk()" style="margin-left:10px;background:none;border:1px solid #ccc;border-radius:6px;padding:8px 14px;color:#888;cursor:pointer;font-size:13px">Stuck? Reset</button>
 
     <div class="progress" id="bulkProgress">
@@ -850,7 +906,7 @@ function ncTemplateChanged() {
   const t = templates[parseInt(document.getElementById('nc_template').value)];
   const needsMedia = t && (t.header_type === 'image' || t.header_type === 'video' || t.header_type === 'document');
   document.getElementById('nc_mediaWrap').style.display = needsMedia ? 'block' : 'none';
-  const hasVars = t && t.body_vars >= 3;
+  const hasVars = t && t.body_vars >= 1;
   document.getElementById('nc_varsWrap').style.display = hasVars ? 'block' : 'none';
 }
 
@@ -858,10 +914,10 @@ async function sendNewChat() {
   const g = id => document.getElementById(id).value.trim();
   const t = templates[parseInt(g('nc_template'))];
   if (!t) { alert('Select a template.'); return; }
-  const hasVars = t.body_vars >= 3;
-  const phone=g('nc_phone'), name=hasVars?g('nc_name'):'-', amount=hasVars?g('nc_amount'):'-', date=hasVars?g('nc_date'):'-';
+  const bv = t.body_vars || 0;
+  const phone=g('nc_phone'), name=bv>=1?g('nc_name'):'-', amount=bv>=2?g('nc_amount'):'-', date=bv>=3?g('nc_date'):'-';
   if (!phone) { alert('Enter a phone number.'); return; }
-  if (hasVars && (!g('nc_name')||!g('nc_amount')||!g('nc_date'))) { alert('Fill in name, amount and date.'); return; }
+  if ((bv>=1 && !g('nc_name')) || (bv>=2 && !g('nc_amount')) || (bv>=3 && !g('nc_date'))) { alert('Fill in the required fields for this template.'); return; }
   const needsMedia = (t.header_type === 'image' || t.header_type === 'video' || t.header_type === 'document');
   const mediaUrl = needsMedia ? g('nc_mediaUrl') : '';
   if (needsMedia && !mediaUrl) { alert('This template needs a media URL.'); return; }
@@ -892,6 +948,7 @@ async function loadTemplates() {
     sel.innerHTML = templates.map((t,i) =>
       `<option value="${i}">${t.name} (${t.language}${t.header_type!=='text'&&t.header_type!=='none' ? ', ' + t.header_type + ' header' : ''})</option>`
     ).join('');
+    document.getElementById('bulkTemplate2').innerHTML = sel.innerHTML;
     templateChanged();
   } catch(e) { sel.innerHTML = '<option value="">Error loading templates</option>'; }
 }
@@ -901,6 +958,19 @@ function templateChanged() {
   const t = templates[parseInt(sel.value)];
   const needsMedia = t && (t.header_type === 'image' || t.header_type === 'video' || t.header_type === 'document');
   document.getElementById('mediaFields').style.display = needsMedia ? 'block' : 'none';
+}
+
+function pairModeChanged() {
+  const on = document.getElementById('pairMode').checked;
+  document.getElementById('pairFields').style.display = on ? 'block' : 'none';
+  if (on) template2Changed();
+}
+
+function template2Changed() {
+  const sel = document.getElementById('bulkTemplate2');
+  const t = templates[parseInt(sel.value)];
+  const needsMedia = t && (t.header_type === 'image' || t.header_type === 'video' || t.header_type === 'document');
+  document.getElementById('mediaFields2').style.display = needsMedia ? 'block' : 'none';
 }
 
 let bulkPolling = null;
@@ -914,11 +984,30 @@ async function startBulk() {
   const mediaUrl = needsMedia ? document.getElementById('bulkMediaUrl').value.trim() : '';
   if (!csv) { alert('Paste your CSV rows first.'); return; }
   if (needsMedia && !mediaUrl) { alert('This template needs a media URL.'); return; }
-  if (!confirm('Send "' + t.name + '" to up to ' + cap + ' contributors?')) return;
+
+  const payload = {csv, cap, template_name: t.name, template_lang: t.language, body_vars: t.body_vars,
+                   media_type: needsMedia ? t.header_type : '', media_url: mediaUrl};
+
+  const pairOn = document.getElementById('pairMode').checked;
+  let confirmMsg = 'Send "' + t.name + '" to up to ' + cap + ' contributors?';
+  if (pairOn) {
+    const sel2 = document.getElementById('bulkTemplate2');
+    const t2 = templates[parseInt(sel2.value)];
+    if (!t2) { alert('Select a 2nd template, or turn off pair mode.'); return; }
+    const needsMedia2 = (t2.header_type === 'image' || t2.header_type === 'video' || t2.header_type === 'document');
+    const mediaUrl2 = needsMedia2 ? document.getElementById('bulkMediaUrl2').value.trim() : '';
+    if (needsMedia2 && !mediaUrl2) { alert('The 2nd template needs a media URL.'); return; }
+    payload.template_name2 = t2.name;
+    payload.template_lang2 = t2.language;
+    payload.body_vars2 = t2.body_vars;
+    payload.media_type2 = needsMedia2 ? t2.header_type : '';
+    payload.media_url2 = mediaUrl2;
+    confirmMsg = 'Send "' + t.name + '" then "' + t2.name + '" (seconds apart) to up to ' + cap + ' contributors?';
+  }
+  if (!confirm(confirmMsg)) return;
 
   const res = await fetch('/api/bulk_start', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({csv, cap, template_name: t.name, template_lang: t.language,
-                          media_type: needsMedia ? t.header_type : '', media_url: mediaUrl})});
+    body: JSON.stringify(payload)});
   if (!res.ok) { const e = await res.json(); alert('Could not start: ' + e.error); return; }
 
   document.getElementById('bulkStart').disabled = true;
