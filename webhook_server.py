@@ -486,11 +486,25 @@ def api_bulk_start():
     if media_type and not media_url:
         return jsonify({"error": "This template has a media header - a media URL is required"}), 400
 
+    required = {"name", "phone", "amount", "date"}
     try:
-        reader = csv.DictReader(io.StringIO(csv_text))
-        rows = list(reader)
-        required = {"name", "phone", "amount", "date"}
-        if not rows or not required.issubset(set(reader.fieldnames or [])):
+        rows, fieldnames = None, None
+        # Try comma, then tab (Excel/Sheets copy-paste uses tabs, not commas)
+        for delim in [",", "\t"]:
+            reader = csv.DictReader(io.StringIO(csv_text), delimiter=delim)
+            candidate_rows = list(reader)
+            fields = {(h or "").strip().lower() for h in (reader.fieldnames or [])}
+            if candidate_rows and required.issubset(fields):
+                rows, fieldnames = candidate_rows, reader.fieldnames
+                break
+        if rows is None:
+            # Fallback: collapse runs of 2+ spaces/tabs (space-aligned paste) into commas
+            normalized = re.sub(r"[ \t]{2,}", ",", csv_text)
+            reader = csv.DictReader(io.StringIO(normalized))
+            rows = list(reader)
+            fields = {(h or "").strip().lower() for h in (reader.fieldnames or [])}
+            fieldnames = reader.fieldnames
+        if not rows or not required.issubset({(h or "").strip().lower() for h in (fieldnames or [])}):
             return jsonify({"error": "CSV must have header: name,phone,amount,date"}), 400
     except Exception as ex:
         return jsonify({"error": f"CSV parse error: {ex}"}), 400
