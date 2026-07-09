@@ -167,6 +167,52 @@ def record_sent(name, phone, amount, date, template_name=None):
     conn.close()
 
 
+def get_delivery_breakdown(template_name):
+    """For everyone recorded as 'sent' for this template, check what (if any)
+    real delivery status webhook ever came back. Numbers with NO status row at
+    all are the likely 'silently dropped' ones - accepted by Meta, but never
+    confirmed sent/delivered/failed."""
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT b.name, b.phone,
+               (SELECT s.status FROM statuses s
+                WHERE s.recipient_number = b.phone
+                ORDER BY s.ts DESC LIMIT 1) AS latest_status
+        FROM bulk_sent_log b
+        WHERE b.template_name = %s
+        ORDER BY b.ts ASC
+    """, (template_name,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
+
+
+def get_numbers_needing_retry(template_name, grace_minutes=60):
+    """Combines two cases that both mean 'treat as NOT sent, retry them':
+    1) An explicit 'failed' status ever came back for that number.
+    2) A bulk send was recorded for this template more than grace_minutes ago,
+       but NO status webhook (sent/delivered/read/failed) ever arrived at all -
+       a likely silent drop, not just a normal reporting delay."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT recipient_number FROM statuses WHERE status = 'failed'")
+    failed = {r[0] for r in cur.fetchall()}
+
+    cur.execute("""
+        SELECT DISTINCT b.phone FROM bulk_sent_log b
+        WHERE b.template_name = %s
+          AND b.ts < NOW() - INTERVAL '%s minutes'
+          AND NOT EXISTS (SELECT 1 FROM statuses s WHERE s.recipient_number = b.phone)
+    """, (template_name, grace_minutes))
+    silent_drops = {r[0] for r in cur.fetchall()}
+
+    cur.close()
+    conn.close()
+    return failed | silent_drops
+
+
 def get_recently_failed_numbers(hours=72):
     """Phone numbers with a real delivery FAILURE reported via the status webhook
     in the last N hours. A send can return success immediately (queued) and then
