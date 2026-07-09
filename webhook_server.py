@@ -390,8 +390,9 @@ def bulk_worker(rows, cap, delay, template_name, media_type, media_url, template
     arrive seconds apart for everyone, instead of running as two full separate passes."""
     global bulk_state
     try:
-        already1 = load_sent_numbers(template_name)
-        already2 = load_sent_numbers(template2["name"]) if template2 else set()
+        recently_failed = storage.get_recently_failed_numbers()
+        already1 = load_sent_numbers(template_name) - recently_failed
+        already2 = (load_sent_numbers(template2["name"]) - recently_failed) if template2 else set()
 
         pending = []
         for r in rows:
