@@ -167,6 +167,24 @@ def record_sent(name, phone, amount, date, template_name=None):
     conn.close()
 
 
+def get_recently_failed_numbers(hours=72):
+    """Phone numbers with a real delivery FAILURE reported via the status webhook
+    in the last N hours. A send can return success immediately (queued) and then
+    genuinely fail later (e.g. daily limit hit mid-batch) - those numbers should
+    NOT be treated as 'already sent' or they'd be skipped forever on retry."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT DISTINCT recipient_number FROM statuses "
+        "WHERE status = 'failed' AND ts > NOW() - INTERVAL '%s hours'",
+        (hours,)
+    )
+    rows = {r[0] for r in cur.fetchall()}
+    cur.close()
+    conn.close()
+    return rows
+
+
 def get_incoming_texts():
     """All incoming (direction='in') messages, oldest first, for RSVP tallying."""
     conn = get_conn()
