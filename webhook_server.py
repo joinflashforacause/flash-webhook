@@ -390,9 +390,12 @@ def bulk_worker(rows, cap, delay, template_name, media_type, media_url, template
     arrive seconds apart for everyone, instead of running as two full separate passes."""
     global bulk_state
     try:
-        recently_failed = storage.get_recently_failed_numbers()
-        already1 = load_sent_numbers(template_name) - recently_failed
-        already2 = (load_sent_numbers(template2["name"]) - recently_failed) if template2 else set()
+        needs_retry1 = storage.get_numbers_needing_retry(template_name)
+        already1 = load_sent_numbers(template_name) - needs_retry1
+        already2 = set()
+        if template2:
+            needs_retry2 = storage.get_numbers_needing_retry(template2["name"])
+            already2 = load_sent_numbers(template2["name"]) - needs_retry2
 
         pending = []
         for r in rows:
@@ -556,6 +559,33 @@ def api_bulk_start():
                      args=(rows, cap, 1.5, template_name, media_type, media_url, template_lang, body_vars, template2),
                      daemon=True).start()
     return jsonify({"status": "started", "rows": len(rows)})
+
+
+@app.route("/api/delivery_check")
+@requires_auth
+def api_delivery_check():
+    template_name = request.args.get("template", "").strip()
+    if not template_name:
+        return jsonify({"error": "Provide ?template=<template_name>"}), 400
+    rows = storage.get_delivery_breakdown(template_name)
+    buckets = {"delivered_or_read": [], "sent_only": [], "failed": [], "no_status_at_all": []}
+    for r in rows:
+        s = r["latest_status"]
+        entry = {"name": r["name"], "phone": r["phone"]}
+        if s in ("delivered", "read"):
+            buckets["delivered_or_read"].append(entry)
+        elif s == "sent":
+            buckets["sent_only"].append(entry)
+        elif s == "failed":
+            buckets["failed"].append(entry)
+        else:
+            buckets["no_status_at_all"].append(entry)
+    return jsonify({
+        "template": template_name,
+        "total_marked_sent": len(rows),
+        "counts": {k: len(v) for k, v in buckets.items()},
+        **buckets
+    })
 
 
 @app.route("/api/bulk_status")
@@ -730,6 +760,16 @@ PAGE_HTML = """
 
     <button class="startbtn" id="bulkStart" onclick="startBulk()" style="margin-top:16px">Start Bulk Send</button>
     <button type="button" onclick="resetBulk()" style="margin-left:10px;background:none;border:1px solid #ccc;border-radius:6px;padding:8px 14px;color:#888;cursor:pointer;font-size:13px">Stuck? Reset</button>
+
+    <div style="margin-top:24px;padding:16px;background:#fff8e6;border-radius:8px;border:1px solid #f0dca0">
+      <div style="font-weight:600;margin-bottom:6px">Check real delivery status</div>
+      <div style="font-size:13px;color:#666;margin-bottom:10px">
+        "Sent" only means Meta accepted the message - not that it arrived. This checks what
+        actually happened to everyone marked sent for the template selected above.
+      </div>
+      <button type="button" onclick="checkDelivery()" style="background:#b8860b;color:white;border:none;border-radius:6px;padding:10px 16px;cursor:pointer">Check Delivery</button>
+      <div id="deliveryResults" style="margin-top:14px"></div>
+    </div>
 
     <div class="progress" id="bulkProgress">
       <div class="bar"><div id="bulkBar"></div></div>
@@ -1014,6 +1054,37 @@ async function startBulk() {
   document.getElementById('bulkStart').disabled = true;
   document.getElementById('bulkProgress').style.display = 'block';
   bulkPolling = setInterval(pollBulk, 2000);
+}
+
+async function checkDelivery() {
+  const sel = document.getElementById('bulkTemplate');
+  const t = templates[parseInt(sel.value)];
+  if (!t) { alert('Select a template first.'); return; }
+  const resultsEl = document.getElementById('deliveryResults');
+  resultsEl.innerHTML = 'Checking…';
+  const res = await fetch('/api/delivery_check?template=' + encodeURIComponent(t.name));
+  const d = await res.json();
+  if (!res.ok) { resultsEl.innerHTML = 'Error: ' + d.error; return; }
+  const problems = [...d.failed, ...d.no_status_at_all];
+  resultsEl.innerHTML = `
+    <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:10px">
+      <div>✅ Delivered/Read: <b>${d.counts.delivered_or_read}</b></div>
+      <div>📤 Sent (not yet confirmed): <b>${d.counts.sent_only}</b></div>
+      <div>❌ Failed: <b>${d.counts.failed}</b></div>
+      <div>⚠️ No status at all: <b>${d.counts.no_status_at_all}</b></div>
+      <div>Total checked: <b>${d.total_marked_sent}</b></div>
+    </div>
+    ${problems.length ? `<button type="button" onclick='downloadProblems(${JSON.stringify(problems)})' style="background:#c0392b;color:white;border:none;border-radius:6px;padding:8px 14px;cursor:pointer">Download ${problems.length} problem numbers as CSV</button>` : '<div style="color:#2a7">No problems found - everyone has a confirmed status.</div>'}
+  `;
+}
+
+function downloadProblems(rows) {
+  const csv = 'name,phone\\n' + rows.map(r => `"${r.name}",${r.phone}`).join('\\n');
+  const blob = new Blob([csv], {type: 'text/csv'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'delivery_problems.csv';
+  a.click();
 }
 
 async function resetBulk() {
