@@ -206,6 +206,11 @@ def receive_webhook():
         for e in data.get("entry", []):
             for change in e.get("changes", []):
                 value = change.get("value", {})
+                n_msgs = len(value.get("messages", []))
+                n_statuses = len(value.get("statuses", []))
+                print(f"WEBHOOK DEBUG: received {n_msgs} messages, {n_statuses} statuses. Raw keys: {list(value.keys())}")
+                if n_statuses:
+                    print(f"WEBHOOK DEBUG: statuses payload = {value.get('statuses')}")
                 contacts = value.get("contacts", [])
                 contact_name = contacts[0]["profile"]["name"] if contacts else ""
 
@@ -224,6 +229,9 @@ def receive_webhook():
                             text_body = i["button_reply"].get("title", "")
                         elif "list_reply" in i:
                             text_body = i["list_reply"].get("title", "")
+                    elif msg_type == "reaction":
+                        emoji = msg.get("reaction", {}).get("emoji", "")
+                        text_body = f"Reacted {emoji}" if emoji else "Removed reaction"
                     else:
                         text_body = f"[{msg_type} message received]"
 
@@ -436,7 +444,8 @@ def bulk_worker(rows, cap, delay, template_name, media_type, media_url, template
                                          body_vars=b_vars)
                     if resp.status_code == 200:
                         bulk_state["success"] += 1
-                        bulk_state["log"].append(f"OK [{label}]: {name} ({phone})")
+                        resp_body = resp.text[:200]
+                        bulk_state["log"].append(f"OK [{label}]: {name} ({phone}) -> {resp_body}")
                         storage.record_sent(name, phone, amount, date, t_name)
                         log_outgoing(phone, name, "template", f"[Bulk {label}] {name} — ₹{amount} — {date}")
                     else:
