@@ -831,6 +831,7 @@ PAGE_HTML = """
 
 <script>
 let currentNumber = null;
+var NL = String.fromCharCode(10);
 
 /* ---------- tabs ---------- */
 function showTab(which) {
@@ -1032,7 +1033,8 @@ async function startBulk() {
   const needsMedia = (t.header_type === 'image' || t.header_type === 'video' || t.header_type === 'document');
   const mediaUrl = needsMedia ? document.getElementById('bulkMediaUrl').value.trim() : '';
   if (!csv) { alert('Paste your CSV rows first.'); return; }
-  const csvHasImageUrlCol = /image_url/i.test(csv.split('\n')[0] || '');
+  var firstLine = csv.split(NL)[0] || '';
+  var csvHasImageUrlCol = /image_url/i.test(firstLine);
   if (needsMedia && !mediaUrl && !(t.header_type === 'image' && csvHasImageUrlCol)) {
     alert('This template needs a media URL (or an "image_url" column in your CSV for personalized images).');
     return;
@@ -1091,7 +1093,7 @@ async function checkDelivery() {
 }
 
 function downloadProblems(rows) {
-  const csv = 'name,phone\\n' + rows.map(r => `"${r.name}",${r.phone}`).join('\\n');
+  var csv = 'name,phone' + NL + rows.map(function(r){ return '"' + r.name + '",' + r.phone; }).join(NL);
   const blob = new Blob([csv], {type: 'text/csv'});
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -1117,7 +1119,7 @@ async function pollBulk() {
   document.getElementById('bulkStats').textContent =
     `${s.done}/${s.total} processed — ${s.success} sent, ${s.failed} failed, ${s.skipped} skipped (already sent earlier)` +
     (s.finished_at ? ` — finished at ${s.finished_at}` : '');
-  document.getElementById('bulkLog').textContent = (s.log||[]).join('\\n');
+  document.getElementById('bulkLog').textContent = (s.log||[]).join(NL);
   const lg = document.getElementById('bulkLog'); lg.scrollTop = lg.scrollHeight;
   if (!s.running && s.done > 0) {
     clearInterval(bulkPolling);
