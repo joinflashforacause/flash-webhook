@@ -423,11 +423,15 @@ def bulk_worker(rows, cap, delay, template_name, media_type, media_url, template
                     bulk_state["failed"] += 1
                     bulk_state["log"].append(f"SKIP (missing data) [{label}]: {r}")
                     return
+                # Per-row personalized image (e.g. a certificate/poster unique to
+                # this contact) overrides the shared media URL, if the CSV has one.
+                row_image = (r.get("image_url") or "").strip()
+                effective_url = row_image if (row_image and m_type == "image") else m_url
                 try:
                     resp = send_template(phone, name, amount, date,
                                          template_name=t_name or None,
                                          media_type=m_type or None,
-                                         media_url=m_url or None,
+                                         media_url=effective_url or None,
                                          language=t_lang or None,
                                          body_vars=b_vars)
                     if resp.status_code == 200:
@@ -505,7 +509,7 @@ def api_bulk_start():
 
     b = request.get_json()
     csv_text = b.get("csv", "").strip()
-    cap = int(b.get("cap", 250))
+    cap = int(b.get("cap", 2000))
     template_name = b.get("template_name", "").strip()
     template_lang = b.get("template_lang", "").strip()
     media_type = b.get("media_type", "").strip()   # "", "image", "video", or "document"
@@ -526,9 +530,6 @@ def api_bulk_start():
         }
         if template2["media_type"] and not template2["media_url"]:
             return jsonify({"error": "The second template has a media header - a media URL is required for it too"}), 400
-
-    if media_type and not media_url:
-        return jsonify({"error": "This template has a media header - a media URL is required"}), 400
 
     required = {"name", "phone", "amount", "date"}
     try:
@@ -552,6 +553,13 @@ def api_bulk_start():
             return jsonify({"error": "CSV must have header: name,phone,amount,date"}), 400
     except Exception as ex:
         return jsonify({"error": f"CSV parse error: {ex}"}), 400
+
+    # A shared media URL is required UNLESS every row already supplies its own
+    # per-contact image_url (e.g. personalized certificates/posters).
+    rows_missing_own_image = any(not (r.get("image_url") or "").strip() for r in rows)
+    if media_type and not media_url and (media_type != "image" or rows_missing_own_image):
+        return jsonify({"error": "This template has a media header - a media URL is required (or every CSV row needs its own image_url)"}), 400
+
 
     bulk_state = {"running": True, "total": 0, "done": 0, "success": 0,
                   "failed": 0, "skipped": 0, "log": [], "finished_at": ""}
@@ -723,7 +731,7 @@ PAGE_HTML = """
     <div class="row2">
       <div>
         <label>Max messages this run (your daily limit)</label>
-        <input id="bulkCap" type="number" value="250">
+        <input id="bulkCap" type="number" value="2000">
       </div>
       <div>
         <label>Template <span style="font-weight:normal;color:#888">(loaded from your WhatsApp Manager)</span></label>
@@ -1017,14 +1025,18 @@ function template2Changed() {
 let bulkPolling = null;
 async function startBulk() {
   const csv = document.getElementById('bulkCsv').value.trim();
-  const cap = parseInt(document.getElementById('bulkCap').value) || 250;
+  const cap = parseInt(document.getElementById('bulkCap').value) || 2000;
   const sel = document.getElementById('bulkTemplate');
   const t = templates[parseInt(sel.value)];
   if (!t) { alert('Select a template first.'); return; }
   const needsMedia = (t.header_type === 'image' || t.header_type === 'video' || t.header_type === 'document');
   const mediaUrl = needsMedia ? document.getElementById('bulkMediaUrl').value.trim() : '';
   if (!csv) { alert('Paste your CSV rows first.'); return; }
-  if (needsMedia && !mediaUrl) { alert('This template needs a media URL.'); return; }
+  const csvHasImageUrlCol = /image_url/i.test(csv.split('\n')[0] || '');
+  if (needsMedia && !mediaUrl && !(t.header_type === 'image' && csvHasImageUrlCol)) {
+    alert('This template needs a media URL (or an "image_url" column in your CSV for personalized images).');
+    return;
+  }
 
   const payload = {csv, cap, template_name: t.name, template_lang: t.language, body_vars: t.body_vars,
                    media_type: needsMedia ? t.header_type : '', media_url: mediaUrl};
