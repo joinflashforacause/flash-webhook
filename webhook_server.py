@@ -399,24 +399,33 @@ bulk_state = {"running": False, "total": 0, "done": 0, "success": 0,
               "failed": 0, "skipped": 0, "log": [], "finished_at": ""}
 
 
-def bulk_worker(rows, cap, delay, template_name, media_type, media_url, template_lang, body_vars=3, template2=None):
+def bulk_worker(rows, cap, delay, template_name, media_type, media_url, template_lang, body_vars=3, template2=None, force_resend=False):
     """template2, if provided, is a dict {name, media_type, media_url, language, body_vars}
     for a SECOND template sent immediately after the first, per contact - so both
-    arrive seconds apart for everyone, instead of running as two full separate passes."""
+    arrive seconds apart for everyone, instead of running as two full separate passes.
+    force_resend=True ignores the already-sent dedup entirely - only intended for
+    deliberate re-testing with a small number of known contacts, NOT for real bulk runs,
+    since it will re-message anyone already sent to."""
     global bulk_state
     try:
-        needs_retry1 = storage.get_numbers_needing_retry(template_name)
-        already1 = load_sent_numbers(template_name) - needs_retry1
-        already2 = set()
-        if template2:
-            needs_retry2 = storage.get_numbers_needing_retry(template2["name"])
-            already2 = load_sent_numbers(template2["name"]) - needs_retry2
+        if force_resend:
+            already1, already2 = set(), set()
+            retry_phones1, retry_phones2 = set(), set()
+        else:
+            retry_phones1 = storage.get_phones_needing_retry(template_name)
+            already1 = load_sent_numbers(template_name)
+            retry_phones2 = set()
+            already2 = set()
+            if template2:
+                retry_phones2 = storage.get_phones_needing_retry(template2["name"])
+                already2 = load_sent_numbers(template2["name"])
 
         pending = []
         for r in rows:
             p = clean_phone(r.get("phone", ""))
-            needs1 = p not in already1
-            needs2 = bool(template2) and p not in already2
+            nm = (r.get("name", "") or "").strip()
+            needs1 = (p, nm) not in already1 or p in retry_phones1
+            needs2 = bool(template2) and ((p, nm) not in already2 or p in retry_phones2)
             if not needs1 and not needs2:
                 bulk_state["skipped"] += 1
                 continue
@@ -536,6 +545,7 @@ def api_bulk_start():
     media_type = b.get("media_type", "").strip()   # "", "image", "video", or "document"
     media_url = b.get("media_url", "").strip()
     body_vars = int(b.get("body_vars", 3))
+    force_resend = bool(b.get("force_resend", False))
 
     # Optional second template - sent right after the first, per contact, so
     # both land seconds apart for everyone instead of two full separate passes.
@@ -585,7 +595,7 @@ def api_bulk_start():
     bulk_state = {"running": True, "total": 0, "done": 0, "success": 0,
                   "failed": 0, "skipped": 0, "log": [], "finished_at": ""}
     threading.Thread(target=bulk_worker,
-                     args=(rows, cap, 1.5, template_name, media_type, media_url, template_lang, body_vars, template2),
+                     args=(rows, cap, 1.5, template_name, media_type, media_url, template_lang, body_vars, template2, force_resend),
                      daemon=True).start()
     return jsonify({"status": "started", "rows": len(rows)})
 
@@ -774,6 +784,11 @@ PAGE_HTML = """
     <label style="display:flex;align-items:center;gap:8px;margin-top:16px;font-weight:normal;cursor:pointer">
       <input type="checkbox" id="pairMode" onchange="pairModeChanged()" style="width:auto">
       Send a 2nd template right after this one, per person (so both arrive seconds apart for everyone)
+    </label>
+
+    <label style="display:flex;align-items:center;gap:8px;margin-top:10px;font-weight:normal;cursor:pointer;color:#b8860b">
+      <input type="checkbox" id="forceResend" style="width:auto">
+      ⚠️ Force resend (ignore "already sent" — only for deliberately re-testing a few known contacts, NOT for your real contributor list)
     </label>
 
     <div id="pairFields" style="display:none;margin-top:10px;padding:14px;background:#f7f7f7;border-radius:8px">
@@ -1063,6 +1078,12 @@ async function startBulk() {
 
   const payload = {csv, cap, template_name: t.name, template_lang: t.language, body_vars: t.body_vars,
                    media_type: needsMedia ? t.header_type : '', media_url: mediaUrl};
+
+  const forceResendOn = document.getElementById('forceResend').checked;
+  if (forceResendOn) {
+    if (!confirm('Force resend is ON. This will re-message EVERYONE in this CSV, including people already sent to before. Are you sure this is a small test list, not your real contributor list?')) return;
+    payload.force_resend = true;
+  }
 
   const pairOn = document.getElementById('pairMode').checked;
   let confirmMsg = 'Send "' + t.name + '" to up to ' + cap + ' contributors?';
