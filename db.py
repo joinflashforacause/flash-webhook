@@ -141,15 +141,17 @@ def get_messages(number):
 
 
 def load_sent_numbers(template_name=None):
-    """Phone numbers already sent a given template. If template_name is
-    omitted, returns numbers sent ANY template (old global behavior)."""
+    """(phone, name) pairs already sent a given template - tracked together so
+    different contributors sharing one phone number (e.g. family members) are
+    each treated as their own recipient, not collapsed into a single 'sent' flag
+    for that number. If template_name is omitted, returns pairs sent ANY template."""
     conn = get_conn()
     cur = conn.cursor()
     if template_name:
-        cur.execute("SELECT DISTINCT phone FROM bulk_sent_log WHERE template_name = %s", (template_name,))
+        cur.execute("SELECT DISTINCT phone, name FROM bulk_sent_log WHERE template_name = %s", (template_name,))
     else:
-        cur.execute("SELECT DISTINCT phone FROM bulk_sent_log")
-    rows = {r[0] for r in cur.fetchall()}
+        cur.execute("SELECT DISTINCT phone, name FROM bulk_sent_log")
+    rows = {(r[0], r[1] or "") for r in cur.fetchall()}
     cur.close()
     conn.close()
     return rows
@@ -189,12 +191,12 @@ def get_delivery_breakdown(template_name):
     return rows
 
 
-def get_numbers_needing_retry(template_name, grace_minutes=60):
-    """Combines two cases that both mean 'treat as NOT sent, retry them':
-    1) An explicit 'failed' status ever came back for that number.
-    2) A bulk send was recorded for this template more than grace_minutes ago,
-       but NO status webhook (sent/delivered/read/failed) ever arrived at all -
-       a likely silent drop, not just a normal reporting delay."""
+def get_phones_needing_retry(template_name, grace_minutes=60):
+    """Phone NUMBERS (not phone+name pairs) that show a real delivery problem for
+    this template - explicit failure, or sent long enough ago with zero status
+    webhook ever received (likely silent drop). Kept phone-level because Meta's
+    status webhooks are keyed by phone number, not by which specific contributor
+    on a shared number the status applies to."""
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT DISTINCT recipient_number FROM statuses WHERE status = 'failed'")
