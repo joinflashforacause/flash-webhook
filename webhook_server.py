@@ -444,8 +444,13 @@ def bulk_worker(rows, cap, delay, template_name, media_type, media_url, template
                                          body_vars=b_vars)
                     if resp.status_code == 200:
                         bulk_state["success"] += 1
-                        resp_body = resp.text[:200]
-                        bulk_state["log"].append(f"OK [{label}]: {name} ({phone}) -> {resp_body}")
+                        try:
+                            resp_json = resp.json()
+                            msg_status = resp_json.get("messages", [{}])[0].get("message_status", "(none)")
+                            msg_id = resp_json.get("messages", [{}])[0].get("id", "")
+                        except Exception:
+                            msg_status, msg_id = "(parse error)", ""
+                        bulk_state["log"].append(f"OK [{label}]: {name} ({phone}) — message_status={msg_status} id={msg_id[-12:]}")
                         storage.record_sent(name, phone, amount, date, t_name)
                         log_outgoing(phone, name, "template", f"[Bulk {label}] {name} — ₹{amount} — {date}")
                     else:
