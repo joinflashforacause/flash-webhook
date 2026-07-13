@@ -46,7 +46,14 @@ MEDIA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "media")
 
 @app.route("/media/<path:filename>")
 def serve_media(filename):
-    return send_from_directory(MEDIA_DIR, filename)
+    # Explicit mimetype + headers: Meta's media fetcher is stricter than a
+    # regular browser about correct Content-Type, so don't rely on Flask's
+    # automatic guessing alone.
+    import mimetypes
+    mimetype, _ = mimetypes.guess_type(filename)
+    resp = send_from_directory(MEDIA_DIR, filename, mimetype=mimetype, conditional=False)
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
 
 # =========================================================
 # CONFIGURATION
